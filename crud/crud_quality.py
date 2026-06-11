@@ -336,6 +336,26 @@ def submit_review_task(
         'conflict_resolved': False,
     }
 
+    # ===== 先收集并同步同冲突其他 RT 为 completed =====
+    other_rts_completed = 0
+    all_rts = []
+    if conflict:
+        sibling_rts = (
+            db.query(ReviewTask)
+            .filter(ReviewTask.conflict_id == conflict.id)
+            .all()
+        )
+        for srt in sibling_rts:
+            if srt.id != rt.id and srt.status != TaskStatus.COMPLETED:
+                srt.status = TaskStatus.COMPLETED
+                srt.resolution_comment = (
+                    submission.resolution_comment
+                    or f"同冲突已由复核人{submission.checker_id}处理完成"
+                )
+                srt.resolution = submission.resolution
+                other_rts_completed += 1
+
+    # ===== 再解决冲突（内部会再次确认 RT 状态，不影响）=====
     if conflict:
         resolve_data = ConflictResolve(
             resolver_id=submission.checker_id,
@@ -346,9 +366,50 @@ def submit_review_task(
         if resolved:
             result['conflict_resolved'] = True
             result['resolution'] = resolved
+            result['conflict'] = resolved.get('conflict')
+            result['sample_updated'] = resolved.get('sample_updated', False)
+
+    # ===== 读取所有 RT 的最新状态转 dict =====
+    if conflict:
+        sibling_rts = (
+            db.query(ReviewTask)
+            .filter(ReviewTask.conflict_id == conflict.id)
+            .all()
+        )
+        all_rts = [{c.name: getattr(srt, c.name) for c in srt.__table__.columns} for srt in sibling_rts]
+
+    # ===== 收集样本最终状态 =====
+    sample_dict = None
+    if rt.sample_id:
+        from crud import crud_samples
+        s = crud_samples.get_sample(db, rt.sample_id)
+        if s:
+            sample_dict = {}
+            for c in s.__table__.columns:
+                col = c.name
+                if col == 'metadata':
+                    sample_dict[col] = s.sample_metadata
+                else:
+                    sample_dict[col] = getattr(s, col)
+
+    # ===== 收集该样本所有标注状态 =====
+    annotations = []
+    if rt.sample_id:
+        from crud import crud_annotations as _ca
+        anns = _ca.get_sample_annotations(db, rt.sample_id)
+        for a in anns:
+            annotations.append({c.name: getattr(a, c.name) for c in a.__table__.columns})
+
+    result['sample'] = sample_dict
+    result['annotations'] = annotations
+    result['annotation_count'] = len(annotations)
+    result['all_conflict_review_tasks'] = all_rts
+    result['other_review_tasks_synced_completed'] = other_rts_completed
 
     db.commit()
     db.refresh(rt)
+    rt_dict2 = {c.name: getattr(rt, c.name) for c in rt.__table__.columns}
+    result['review_task'] = rt_dict2
     return result
 
 
@@ -405,6 +466,9 @@ def complete_rework(
     db: Session,
     rework_id: int,
     new_annotation_id: Optional[int] = None,
+    new_annotation_content: Optional[dict] = None,
+    rework_annotator_id: Optional[int] = None,
+    time_spent_seconds: Optional[int] = None,
 ) -> Optional[dict]:
     rework = get_rework(db, rework_id)
     if not rework:
@@ -412,16 +476,52 @@ def complete_rework(
 
     rework.status = TaskStatus.COMPLETED
     rework.completed_at = datetime.utcnow()
-    rework.new_annotation_id = new_annotation_id
 
-    if new_annotation_id:
+    # 如果传了新内容，优先创建一条新的 Annotation
+    new_ann = None
+    if new_annotation_content is not None and rework.sample_id and rework.project_id:
+        target_annotator = (
+            rework_annotator_id
+            or rework.rework_annotator_id
+            or rework.original_annotator_id
+        )
+        from schemas import AnnotationCreate
+        from crud import crud_annotations
+        ann_create = AnnotationCreate(
+            sample_id=rework.sample_id,
+            task_id=None,
+            content=new_annotation_content,
+            time_spent_seconds=time_spent_seconds or 0,
+        )
+        created_tuple = crud_annotations.create_annotation(
+            db=db, annotator_id=target_annotator, annotation=ann_create,
+            task_id=None, allow_rework=True,
+        )
+        if isinstance(created_tuple, tuple):
+            new_ann = created_tuple[0]
+        else:
+            new_ann = created_tuple
+
+        if new_ann:
+            from models import AnnotationStatus
+            try:
+                new_ann.status = AnnotationStatus.SUBMITTED
+                new_ann.version = (new_ann.version or 0) + 1
+            except Exception:
+                pass
+            rework.new_annotation_id = new_ann.id
+    elif new_annotation_id:
         from models import Annotation, AnnotationStatus
         new_ann = db.query(Annotation).filter(
             Annotation.id == new_annotation_id
         ).first()
         if new_ann:
             new_ann.status = AnnotationStatus.SUBMITTED
-            new_ann.version += 1
+            try:
+                new_ann.version = (new_ann.version or 0) + 1
+            except Exception:
+                pass
+            rework.new_annotation_id = new_ann.id
 
     consistency_result = None
     if rework.sample_id:
@@ -432,8 +532,28 @@ def complete_rework(
     db.refresh(rework)
 
     rework_dict = {c.name: getattr(rework, c.name) for c in rework.__table__.columns}
+
+    new_ann_dict = None
+    if new_ann:
+        new_ann_dict = {c.name: getattr(new_ann, c.name) for c in new_ann.__table__.columns}
+
+    sample_dict = None
+    if rework.sample_id:
+        from crud import crud_samples
+        s = crud_samples.get_sample(db, rework.sample_id)
+        if s:
+            sample_dict = {}
+            for c in s.__table__.columns:
+                col = c.name
+                if col == 'metadata':
+                    sample_dict[col] = s.sample_metadata
+                else:
+                    sample_dict[col] = getattr(s, col)
+
     return {
         "rework": rework_dict,
+        "new_annotation": new_ann_dict,
+        "sample": sample_dict,
         "consistency_checked": consistency_result is not None,
         "consistency_result": consistency_result,
     }
@@ -456,6 +576,14 @@ def batch_process_quality_checks(
     failed = 0
     results = []
     rework_ids_created = []
+    sample_ids_touched = set()
+    annotation_ids_touched = set()
+
+    target_qc_status = {
+        'approve': QualityStatus.PASSED,
+        'reject': QualityStatus.FAILED,
+        'rework': QualityStatus.NEEDS_REWORK,
+    }[action]
 
     for qc_id in quality_check_ids:
         try:
@@ -465,110 +593,134 @@ def batch_process_quality_checks(
                 failed += 1
                 continue
 
+            if qc.status != QualityStatus.PENDING:
+                results.append({
+                    "quality_check_id": qc_id,
+                    "success": False,
+                    "error": f"质检记录状态已为 {qc.status.value}，不能重复处理",
+                })
+                failed += 1
+                continue
+
+            qc.status = target_qc_status
+            if common_quality_score is not None:
+                qc.quality_score = common_quality_score
+            if common_comment:
+                qc.comment = common_comment
+            qc.checker_id = checker_id
+
+            sample = db.query(Sample).filter(Sample.id == qc.sample_id).first() if qc.sample_id else None
+            if sample:
+                sample_ids_touched.add(sample.id)
+
+            annotation = None
+            if qc.annotation_id:
+                annotation = db.query(Annotation).filter(Annotation.id == qc.annotation_id).first()
+                if annotation:
+                    annotation_ids_touched.add(annotation.id)
+
+            # 如无指定 annotation，尝试从 sample 下找最近一条 SUBMITTED 标注
+            if annotation is None and qc.sample_id:
+                annotation = (
+                    db.query(Annotation)
+                    .filter(
+                        Annotation.sample_id == qc.sample_id,
+                        Annotation.status.in_([
+                            AnnotationStatus.SUBMITTED,
+                            AnnotationStatus.APPROVED,
+                            AnnotationStatus.REJECTED,
+                        ]),
+                    )
+                    .order_by(Annotation.created_at.desc())
+                    .first()
+                )
+                if annotation:
+                    annotation_ids_touched.add(annotation.id)
+
             if action == 'approve':
-                qc.quality_status = QualityStatus.APPROVED
-                qc.quality_score = common_quality_score if common_quality_score is not None else (qc.quality_score or 1.0)
-                qc.checker_comment = common_comment or qc.checker_comment
-                qc.checker_id = checker_id
-
-                if qc.annotation_id:
-                    from models import AnnotationStatus
-                    from crud import crud_annotations
-                    ann = crud_annotations.get_annotation(db, qc.annotation_id)
-                    if ann:
-                        ann.status = AnnotationStatus.APPROVED
-
-                if qc.sample_id:
-                    from models import Sample, SampleStatus, ConsistencyLevel
-                    sample = db.query(Sample).filter(Sample.id == qc.sample_id).first()
-                    if sample:
-                        sample.status = SampleStatus.APPROVED
-                        sample.consistency_score = 1.0
-                        sample.consistency_level = ConsistencyLevel.HIGH
-                        if qc.annotation_id:
-                            from crud import crud_annotations as _ca
-                            ann = _ca.get_annotation(db, qc.annotation_id)
-                            if ann:
-                                sample.final_annotation = ann.content
-
-                results.append({"quality_check_id": qc_id, "success": True, "action": "approved"})
+                if annotation:
+                    annotation.status = AnnotationStatus.APPROVED
+                if sample:
+                    sample.status = SampleStatus.APPROVED
+                    from models import ConsistencyLevel
+                    sample.consistency_score = 1.0
+                    sample.consistency_level = ConsistencyLevel.HIGH
+                    if annotation:
+                        sample.final_annotation = annotation.content
+                results.append({"quality_check_id": qc_id, "success": True, "action": "passed"})
                 processed += 1
 
             elif action == 'reject':
-                qc.quality_status = QualityStatus.REJECTED
-                qc.quality_score = common_quality_score if common_quality_score is not None else (qc.quality_score or 0.0)
-                qc.checker_comment = common_comment or qc.checker_comment
-                qc.checker_id = checker_id
-
-                if qc.annotation_id:
-                    from models import AnnotationStatus
-                    from crud import crud_annotations
-                    ann = crud_annotations.get_annotation(db, qc.annotation_id)
-                    if ann:
-                        ann.status = AnnotationStatus.REJECTED
-
-                if qc.sample_id:
-                    from models import Sample, SampleStatus
-                    sample = db.query(Sample).filter(Sample.id == qc.sample_id).first()
-                    if sample:
-                        sample.status = SampleStatus.REJECTED
-
-                results.append({"quality_check_id": qc_id, "success": True, "action": "rejected"})
+                if annotation:
+                    annotation.status = AnnotationStatus.REJECTED
+                if sample:
+                    sample.status = SampleStatus.REJECTED
+                results.append({"quality_check_id": qc_id, "success": True, "action": "failed"})
                 processed += 1
 
             elif action == 'rework':
-                qc.quality_status = QualityStatus.REWORK_REQUIRED
-                qc.quality_score = common_quality_score if common_quality_score is not None else qc.quality_score
-                qc.checker_comment = common_comment or qc.checker_comment or rework_reason or "需要返工"
-                qc.checker_id = checker_id
-
-                if qc.annotation_id:
-                    from models import AnnotationStatus
-                    from crud import crud_annotations
-                    ann = crud_annotations.get_annotation(db, qc.annotation_id)
-                    if ann:
-                        ann.status = AnnotationStatus.REJECTED
-
-                if qc.sample_id:
-                    from models import Sample, SampleStatus
-                    sample = db.query(Sample).filter(Sample.id == qc.sample_id).first()
-                    if sample:
-                        sample.status = SampleStatus.ANNOTATING
-
-                from schemas import ReworkRecordCreate
+                # 确定返工对象标注员
                 original_annotator_id = None
-                if qc.annotation_id:
-                    from crud import crud_annotations as _ca2
-                    ann = _ca2.get_annotation(db, qc.annotation_id)
-                    if ann:
-                        original_annotator_id = ann.annotator_id
+                if annotation:
+                    original_annotator_id = annotation.annotator_id
+                elif rework_target_annotator_id:
+                    original_annotator_id = rework_target_annotator_id
+                else:
+                    # 从该样本下任意提交过的标注里取一个标注员
+                    any_ann = (
+                        db.query(Annotation)
+                        .filter(Annotation.sample_id == qc.sample_id)
+                        .order_by(Annotation.created_at.desc())
+                        .first()
+                    )
+                    if any_ann:
+                        original_annotator_id = any_ann.annotator_id
 
+                if original_annotator_id is None and not rework_target_annotator_id:
+                    results.append({
+                        "quality_check_id": qc_id,
+                        "success": False,
+                        "error": "找不到可返工的标注员：该样本下没有任何标注记录，请指定 rework_target_annotator_id",
+                    })
+                    failed += 1
+                    continue
+
+                if annotation:
+                    annotation.status = AnnotationStatus.REJECTED
+                if sample:
+                    sample.status = SampleStatus.ANNOTATING
+
+                final_original_id = original_annotator_id or rework_target_annotator_id
                 rework_create = ReworkRecordCreate(
                     project_id=qc.project_id,
                     sample_id=qc.sample_id,
                     quality_check_id=qc.id,
-                    original_annotator_id=original_annotator_id,
+                    original_annotator_id=final_original_id,
                     rework_annotator_id=(
                         rework_target_annotator_id
                         if rework_target_annotator_id is not None
-                        else original_annotator_id
+                        else final_original_id
                     ),
                     reason=rework_reason or "质检不合格，需要返工",
                     issue_fields=None,
                 )
                 rework_record = create_rework(db, rework_create)
+                rework_id = None
                 if rework_record:
-                    rework_ids_created.append(rework_record.id)
+                    rework_id = rework_record.id
+                    rework_ids_created.append(rework_id)
 
                 results.append({
                     "quality_check_id": qc_id,
                     "success": True,
                     "action": "rework_created",
-                    "rework_id": rework_record.id if rework_record else None,
+                    "rework_id": rework_id,
+                    "original_annotator_id": final_original_id,
                 })
                 processed += 1
 
         except Exception as e:
+            db.rollback()
             results.append({"quality_check_id": qc_id, "success": False, "error": str(e)})
             failed += 1
             continue
@@ -582,4 +734,6 @@ def batch_process_quality_checks(
         "failed": failed,
         "details": results,
         "rework_ids_created": rework_ids_created,
+        "sample_ids_updated": sorted(list(sample_ids_touched)),
+        "annotation_ids_updated": sorted(list(annotation_ids_touched)),
     }

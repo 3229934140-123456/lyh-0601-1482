@@ -330,6 +330,13 @@ class ReworkRecordBase(BaseModel):
     pass
 
 
+class ReworkComplete(BaseModel):
+    new_annotation_content: Optional[dict] = None
+    new_annotation_id: Optional[int] = None
+    time_spent_seconds: Optional[int] = None
+    rework_annotator_id: Optional[int] = None
+
+
 class ReworkRecordCreate(BaseModel):
     project_id: int
     sample_id: int

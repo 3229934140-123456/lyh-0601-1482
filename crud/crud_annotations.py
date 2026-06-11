@@ -15,6 +15,7 @@ def validate_annotation_permission(
     annotator_id: int,
     sample_id: int,
     task_id: Optional[int] = None,
+    allow_rework: bool = False,
 ) -> Tuple[bool, str, dict]:
     sample = db.query(Sample).filter(Sample.id == sample_id).first()
     if not sample:
@@ -62,25 +63,26 @@ def validate_annotation_permission(
                 f"标注员只能标注自己领取到的任务样本"
             ), result_context
 
-    existing_ann = (
-        db.query(Annotation)
-        .filter(
-            Annotation.sample_id == sample_id,
-            Annotation.annotator_id == annotator_id,
-            Annotation.status.in_([
-                AnnotationStatus.DRAFT,
-                AnnotationStatus.SUBMITTED,
-                AnnotationStatus.APPROVED,
-                AnnotationStatus.CONFLICT,
-            ])
+    if not allow_rework:
+        existing_ann = (
+            db.query(Annotation)
+            .filter(
+                Annotation.sample_id == sample_id,
+                Annotation.annotator_id == annotator_id,
+                Annotation.status.in_([
+                    AnnotationStatus.DRAFT,
+                    AnnotationStatus.SUBMITTED,
+                    AnnotationStatus.APPROVED,
+                    AnnotationStatus.CONFLICT,
+                ])
+            )
+            .first()
         )
-        .first()
-    )
-    if existing_ann:
-        return False, (
-            f"标注员{annotator_id}已提交过样本{sample_id}的标注"
-            f"(状态:{existing_ann.status.value})，不允许重复提交"
-        ), {**result_context, "existing_annotation_id": existing_ann.id}
+        if existing_ann:
+            return False, (
+                f"标注员{annotator_id}已提交过样本{sample_id}的标注"
+                f"(状态:{existing_ann.status.value})，不允许重复提交"
+            ), {**result_context, "existing_annotation_id": existing_ann.id}
 
     return True, "权限校验通过", result_context
 
@@ -89,12 +91,15 @@ def create_annotation(
     db: Session,
     annotator_id: int,
     annotation: AnnotationCreate,
+    task_id: Optional[int] = None,
+    allow_rework: bool = False,
 ) -> Tuple[Optional[Annotation], Optional[str]]:
     is_valid, error_msg, ctx = validate_annotation_permission(
         db=db,
         annotator_id=annotator_id,
         sample_id=annotation.sample_id,
-        task_id=annotation.task_id,
+        task_id=task_id if task_id is not None else annotation.task_id,
+        allow_rework=allow_rework,
     )
     if not is_valid:
         return None, f"[PERMISSION_DENIED] {error_msg}"

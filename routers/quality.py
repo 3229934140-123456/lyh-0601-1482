@@ -8,6 +8,7 @@ from schemas import (
     QualityCheckCreate, QualityCheckSubmit, QualityCheck,
     QualitySampleRequest, ConflictRecord, ConflictResolve,
     ReviewTaskSubmit, ReviewTask, ReworkRecordCreate, ReworkRecord,
+    ReworkComplete,
     ApiResponse, PaginatedResponse, UserLite
 )
 from crud import crud_quality, crud_projects, crud_users
@@ -393,7 +394,7 @@ def list_reworks(
 @router.post("/reworks/{rework_id}/complete", response_model=ApiResponse)
 def complete_rework(
     rework_id: int,
-    new_annotation_id: Optional[int] = None,
+    completion: Optional[ReworkComplete] = None,
     db: Session = Depends(get_db),
 ):
     rework = crud_quality.get_rework(db, rework_id)
@@ -407,13 +408,32 @@ def complete_rework(
             data=None,
         )
 
-    completed = crud_quality.complete_rework(db, rework_id, new_annotation_id)
+    new_annotation_id = None
+    new_annotation_content = None
+    rework_annotator_id = None
+    time_spent_seconds = None
+    if completion:
+        new_annotation_id = completion.new_annotation_id
+        new_annotation_content = completion.new_annotation_content
+        rework_annotator_id = completion.rework_annotator_id
+        time_spent_seconds = completion.time_spent_seconds
+
+    completed = crud_quality.complete_rework(
+        db=db,
+        rework_id=rework_id,
+        new_annotation_id=new_annotation_id,
+        new_annotation_content=new_annotation_content,
+        rework_annotator_id=rework_annotator_id,
+        time_spent_seconds=time_spent_seconds,
+    )
+    if not completed:
+        raise HTTPException(status_code=500, detail="返工完成失败")
     return ApiResponse(data=completed, message="返工任务完成")
 
 
 @router.post("/quality-checks/batch", response_model=ApiResponse)
 def batch_process_quality_checks(
-    quality_check_ids: List[int],
+    quality_check_ids: List[int] = Query(..., description="质检记录ID列表"),
     checker_id: int = Query(..., description="质检员ID"),
     action: str = Query(..., description="批量操作：approve=通过/reject=驳回/rework=返工"),
     common_comment: Optional[str] = Query(None, description="批量备注内容"),
