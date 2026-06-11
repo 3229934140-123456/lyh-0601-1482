@@ -1,17 +1,109 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from sqlalchemy.orm import Session
 
-from models import Annotation, AnnotationStatus, Sample, SampleStatus, Project
+from models import (
+    Annotation, AnnotationStatus, Sample, SampleStatus,
+    Project, Task, TaskSample, TaskStatus
+)
 from schemas import AnnotationCreate, AnnotationSubmit
 from services.consistency_service import check_annotation_consistency
 
 
-def create_annotation(db: Session, annotator_id: int, annotation: AnnotationCreate) -> Annotation:
+def validate_annotation_permission(
+    db: Session,
+    annotator_id: int,
+    sample_id: int,
+    task_id: Optional[int] = None,
+) -> Tuple[bool, str, dict]:
+    sample = db.query(Sample).filter(Sample.id == sample_id).first()
+    if not sample:
+        return False, "样本不存在", {"sample_id": sample_id}
+
+    result_context = {
+        "sample_id": sample_id,
+        "project_id": sample.project_id,
+    }
+
+    if task_id is not None:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            return False, "任务不存在", {"task_id": task_id, **result_context}
+
+        result_context["task_project_id"] = task.project_id
+        result_context["task_assignee_id"] = task.assignee_id
+
+        if task.project_id != sample.project_id:
+            return False, (
+                f"项目不一致：任务属于项目{task.project_id}，"
+                f"但样本属于项目{sample.project_id}"
+            ), result_context
+
+        if task.assignee_id != annotator_id:
+            return False, (
+                f"任务归属不一致：任务{task_id}分配给标注员{task.assignee_id}，"
+                f"当前标注员是{annotator_id}"
+            ), result_context
+
+        if task.status in [TaskStatus.COMPLETED]:
+            return False, f"任务{task_id}已完成，无法继续提交标注", result_context
+
+        task_sample = (
+            db.query(TaskSample)
+            .filter(
+                TaskSample.task_id == task_id,
+                TaskSample.sample_id == sample_id,
+            )
+            .first()
+        )
+        if not task_sample:
+            return False, (
+                f"样本{sample_id}不在任务{task_id}的样本列表中，"
+                f"标注员只能标注自己领取到的任务样本"
+            ), result_context
+
+    existing_ann = (
+        db.query(Annotation)
+        .filter(
+            Annotation.sample_id == sample_id,
+            Annotation.annotator_id == annotator_id,
+            Annotation.status.in_([
+                AnnotationStatus.DRAFT,
+                AnnotationStatus.SUBMITTED,
+                AnnotationStatus.APPROVED,
+                AnnotationStatus.CONFLICT,
+            ])
+        )
+        .first()
+    )
+    if existing_ann:
+        return False, (
+            f"标注员{annotator_id}已提交过样本{sample_id}的标注"
+            f"(状态:{existing_ann.status.value})，不允许重复提交"
+        ), {**result_context, "existing_annotation_id": existing_ann.id}
+
+    return True, "权限校验通过", result_context
+
+
+def create_annotation(
+    db: Session,
+    annotator_id: int,
+    annotation: AnnotationCreate,
+) -> Tuple[Optional[Annotation], Optional[str]]:
+    is_valid, error_msg, ctx = validate_annotation_permission(
+        db=db,
+        annotator_id=annotator_id,
+        sample_id=annotation.sample_id,
+        task_id=annotation.task_id,
+    )
+    if not is_valid:
+        return None, f"[PERMISSION_DENIED] {error_msg}"
+
+    sample = db.query(Sample).filter(Sample.id == annotation.sample_id).first()
+    project_id = sample.project_id
+
     db_annotation = Annotation(
-        project_id=annotation.sample_id and db.query(Sample).filter(
-            Sample.id == annotation.sample_id
-        ).first().project_id if annotation.sample_id else 0,
+        project_id=project_id,
         sample_id=annotation.sample_id,
         annotator_id=annotator_id,
         task_id=annotation.task_id,
@@ -20,16 +112,13 @@ def create_annotation(db: Session, annotator_id: int, annotation: AnnotationCrea
         comment=annotation.comment,
     )
 
-    sample = db.query(Sample).filter(Sample.id == annotation.sample_id).first()
-    if sample:
-        db_annotation.project_id = sample.project_id
-        if sample.status == SampleStatus.ASSIGNED or sample.status == SampleStatus.PENDING:
-            sample.status = SampleStatus.ANNOTATING
+    if sample.status in [SampleStatus.ASSIGNED, SampleStatus.PENDING, SampleStatus.REJECTED]:
+        sample.status = SampleStatus.ANNOTATING
 
     db.add(db_annotation)
     db.commit()
     db.refresh(db_annotation)
-    return db_annotation
+    return db_annotation, None
 
 
 def get_annotation(db: Session, annotation_id: int) -> Optional[Annotation]:
@@ -92,10 +181,34 @@ def submit_annotation(
     db: Session,
     annotation_id: int,
     submission: AnnotationSubmit,
-) -> Optional[dict]:
+    submitter_id: Optional[int] = None,
+) -> Tuple[Optional[dict], Optional[str]]:
     annotation = get_annotation(db, annotation_id)
     if not annotation:
-        return None
+        return None, "标注不存在"
+
+    if submitter_id is not None and annotation.annotator_id != submitter_id:
+        return None, (
+            f"[PERMISSION_DENIED] 标注{annotation_id}的归属标注员是"
+            f"{annotation.annotator_id}，提交人{submitter_id}无权提交"
+        )
+
+    if annotation.task_id is not None:
+        task = db.query(Task).filter(Task.id == annotation.task_id).first()
+        if task:
+            if task.status == TaskStatus.COMPLETED:
+                return None, (
+                    f"关联任务{task.id}已完成，无法继续提交标注"
+                )
+            if submitter_id is not None and task.assignee_id != submitter_id:
+                return None, (
+                    f"[PERMISSION_DENIED] 任务{task.id}的归属人是"
+                    f"{task.assignee_id}，提交人{submitter_id}无权操作"
+                )
+
+    sample = db.query(Sample).filter(Sample.id == annotation.sample_id).first()
+    if sample and sample.project_id != annotation.project_id:
+        return None, "数据异常：样本与标注项目不一致，拒绝提交以防脏数据"
 
     annotation.content = submission.content
     annotation.time_spent_seconds = submission.time_spent_seconds
@@ -119,7 +232,7 @@ def submit_annotation(
     return {
         'annotation': annotation,
         'consistency': consistency_result,
-    }
+    }, None
 
 
 def process_sample_consistency(db: Session, sample_id: int) -> dict:
@@ -214,12 +327,57 @@ def process_sample_consistency(db: Session, sample_id: int) -> dict:
                 consistency_score=consistency_result['consistency_score'],
             )
             db.add(conflict)
+            db.flush()
+
+            from models import UserRole, ReviewTask as RT, User
+
+            quality_checkers = (
+                db.query(User)
+                .filter(
+                    User.role.in_([UserRole.QUALITY_CHECKER, UserRole.ADMIN]),
+                    User.is_active == True,
+                )
+                .all()
+            )
+
+            created_review_tasks = []
+            for qc in quality_checkers:
+                existing_rt = (
+                    db.query(RT)
+                    .filter(
+                        RT.conflict_id == conflict.id,
+                        RT.assignee_id == qc.id,
+                    )
+                    .first()
+                )
+                if not existing_rt:
+                    rt = RT(
+                        project_id=sample.project_id,
+                        conflict_id=conflict.id,
+                        sample_id=sample_id,
+                        assignee_id=qc.id,
+                    )
+                    db.add(rt)
+                    created_review_tasks.append({
+                        'review_task_id': None,
+                        'assignee_id': qc.id,
+                        'assignee_name': qc.display_name,
+                    })
+
+            if created_review_tasks:
+                db.flush()
+                for i, rt_obj in enumerate(created_review_tasks):
+                    created_review_tasks[i]['review_task_id'] = rt_obj.get('review_task_id')
 
             result['action'] = 'conflict_created'
             result['conflict_created'] = True
+            result['review_tasks_created'] = len(created_review_tasks)
+            result['review_tasks'] = created_review_tasks
+            result['assigned_quality_checkers'] = [qc.display_name for qc in quality_checkers]
         else:
             result['action'] = 'conflict_exists'
             result['conflict_created'] = False
+            result['review_tasks_created'] = 0
 
     db.commit()
     return result

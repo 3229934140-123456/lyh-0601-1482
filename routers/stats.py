@@ -31,22 +31,30 @@ def get_annotator_progress(
 def list_annotators_progress(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
-    project_id: Optional[int] = None,
+    project_id: Optional[int] = Query(None, description="按项目筛选"),
+    role: Optional[str] = Query(None, description="按角色筛选：admin/annotator/quality_checker"),
+    date_from: Optional[str] = Query(None, description="开始日期 YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="结束日期 YYYY-MM-DD"),
     db: Session = Depends(get_db),
 ):
     skip = (page - 1) * page_size
-    progress_list = crud_stats.get_all_annotators_progress(db, project_id, skip, page_size)
+    try:
+        progress_list = crud_stats.get_all_annotators_progress(
+            db, project_id=project_id, role=role,
+            date_from=date_from, date_to=date_to,
+            skip=skip, limit=page_size,
+        )
+    except ValueError as e:
+        return ApiResponse(code=400, message=str(e), data=None)
 
-    from models import UserRole as UR
-    total_annotators = crud_users.count_users(
-        db, role=UR.ANNOTATOR, is_active=True
-    )
-    total_qc = crud_users.count_users(
-        db, role=UR.QUALITY_CHECKER, is_active=True
-    )
-    total = total_annotators + total_qc
+    try:
+        total_items = crud_stats.get_all_annotators_progress_count(db, project_id, role)
+        projects_count = 1 if project_id else max(crud_projects.count_projects(db), 1)
+        total = total_items * projects_count
+    except Exception:
+        total = len(progress_list) + (skip if page > 1 else 0)
 
-    total_pages = (total + page_size - 1) // page_size
+    total_pages = (max(total, len(progress_list)) + page_size - 1) // page_size
 
     return ApiResponse(data=PaginatedResponse(
         total=total, page=page, page_size=page_size,

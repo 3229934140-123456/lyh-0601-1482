@@ -37,7 +37,31 @@ def assign_task(
             data=None,
         )
 
-    return ApiResponse(data=task, message="任务分配成功")
+    task_dict = {c.name: getattr(task, c.name) for c in task.__table__.columns}
+    from crud import crud_tasks as _ct
+    task_samples = _ct.get_task_samples(db, task.id)
+    sample_ids = [ts.sample_id for ts in task_samples]
+    from crud import crud_samples as _cs
+    samples = [_cs.get_sample(db, sid) for sid in sample_ids]
+    sample_dicts = []
+    for s in samples:
+        if s:
+            sd = {}
+            for c in s.__table__.columns:
+                col_name = c.name
+                if col_name == 'metadata':
+                    val = s.sample_metadata
+                else:
+                    val = getattr(s, col_name)
+                sd[col_name] = val
+            sample_dicts.append(sd)
+    result = {
+        "task": task_dict,
+        "samples": sample_dicts,
+        "sample_ids": sample_ids,
+        "sample_count": len(sample_ids),
+    }
+    return ApiResponse(data=result, message="任务分配成功")
 
 
 @router.post("/claim", response_model=ApiResponse, status_code=201)
@@ -66,7 +90,31 @@ def claim_task(
             data=None,
         )
 
-    return ApiResponse(data=task, message="任务领取成功")
+    task_dict = {c.name: getattr(task, c.name) for c in task.__table__.columns}
+    from crud import crud_tasks as _ct2
+    task_samples = _ct2.get_task_samples(db, task.id)
+    sample_ids = [ts.sample_id for ts in task_samples]
+    from crud import crud_samples as _cs2
+    samples = [_cs2.get_sample(db, sid) for sid in sample_ids]
+    sample_dicts = []
+    for s in samples:
+        if s:
+            sd = {}
+            for c in s.__table__.columns:
+                col_name = c.name
+                if col_name == 'metadata':
+                    val = s.sample_metadata
+                else:
+                    val = getattr(s, col_name)
+                sd[col_name] = val
+            sample_dicts.append(sd)
+    result = {
+        "task": task_dict,
+        "samples": sample_dicts,
+        "sample_ids": sample_ids,
+        "sample_count": len(sample_ids),
+    }
+    return ApiResponse(data=result, message="任务领取成功")
 
 
 @router.get("", response_model=ApiResponse)
@@ -188,14 +236,24 @@ def create_annotation(
     if annotation.task_id is None:
         annotation.task_id = task_id
 
-    db_annotation = crud_annotations.create_annotation(db, annotator_id, annotation)
-    return ApiResponse(data=db_annotation, message="标注创建成功（草稿状态）")
+    db_annotation, err = crud_annotations.create_annotation(db, annotator_id, annotation)
+    if err is not None:
+        is_permission = "[PERMISSION_DENIED]" in err
+        clean_err = err.replace("[PERMISSION_DENIED]", "").strip()
+        return ApiResponse(
+            code=403 if is_permission else 400,
+            message=f"标注创建失败：{clean_err}",
+            data={"error_type": "permission_denied" if is_permission else "validation_error"},
+        )
+    ann_dict = {c.name: getattr(db_annotation, c.name) for c in db_annotation.__table__.columns}
+    return ApiResponse(data=ann_dict, message="标注创建成功（草稿状态）")
 
 
 @router.post("/annotations/{annotation_id}/submit", response_model=ApiResponse)
 def submit_annotation(
     annotation_id: int,
     submission: AnnotationSubmit,
+    submitter_id: Optional[int] = Query(None, description="提交人ID，用于校验归属权限"),
     db: Session = Depends(get_db),
 ):
     annotation = crud_annotations.get_annotation(db, annotation_id)
@@ -211,9 +269,22 @@ def submit_annotation(
                 data=None,
             )
 
-    result = crud_annotations.submit_annotation(db, annotation_id, submission)
+    result, err = crud_annotations.submit_annotation(db, annotation_id, submission, submitter_id)
+    if err is not None:
+        is_permission = "[PERMISSION_DENIED]" in err
+        clean_err = err.replace("[PERMISSION_DENIED]", "").strip()
+        return ApiResponse(
+            code=403 if is_permission else 400,
+            message=f"标注提交失败：{clean_err}",
+            data={"error_type": "permission_denied" if is_permission else "validation_error"},
+        )
     if not result:
         raise HTTPException(status_code=500, detail="标注提交失败")
+
+    ann_obj = result.get('annotation')
+    if ann_obj is not None:
+        ann_dict = {c.name: getattr(ann_obj, c.name) for c in ann_obj.__table__.columns}
+        result['annotation'] = ann_dict
 
     return ApiResponse(
         data=result,

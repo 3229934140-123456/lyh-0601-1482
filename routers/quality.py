@@ -36,9 +36,13 @@ def create_quality_checks_by_sampling(
         sample_rate=req.sample_rate,
     )
 
+    qc_dicts = []
+    for qc in qcs:
+        qc_dicts.append({c.name: getattr(qc, c.name) for c in qc.__table__.columns})
+
     return ApiResponse(
-        data={"count": len(qcs), "quality_checks": qcs},
-        message=f"抽样创建了 {len(qcs)} 个质检任务",
+        data={"count": len(qc_dicts), "quality_checks": qc_dicts},
+        message=f"抽样创建了 {len(qc_dicts)} 个质检任务",
     )
 
 
@@ -255,9 +259,50 @@ def list_review_tasks(
     rts_with_data = []
     for rt in rts:
         assignee = crud_users.get_user(db, rt.assignee_id)
+        from crud import crud_samples
+        sample = crud_samples.get_sample(db, rt.sample_id)
+        from crud import crud_annotations
+        annotations = crud_annotations.get_sample_annotations(db, rt.sample_id) if rt.sample_id else []
         rt_dict = {c.name: getattr(rt, c.name) for c in rt.__table__.columns}
-        rt_dict['assignee'] = assignee
+
+        if assignee:
+            rt_dict['assignee'] = {c.name: getattr(assignee, c.name) for c in assignee.__table__.columns}
+        else:
+            rt_dict['assignee'] = None
+
+        if sample:
+            sample_dict = {}
+            for c in sample.__table__.columns:
+                col_name = c.name
+                if col_name == 'metadata':
+                    val = sample.sample_metadata
+                else:
+                    val = getattr(sample, col_name)
+                sample_dict[col_name] = val
+            rt_dict['sample'] = sample_dict
+            rt_dict['sample_content_preview'] = (sample.content or '')[:100]
+            rt_dict['sample_external_id'] = sample.external_id
+        else:
+            rt_dict['sample'] = None
+            rt_dict['sample_content_preview'] = None
+            rt_dict['sample_external_id'] = None
+
+        annotation_dicts = []
+        for ann in annotations:
+            ann_dict = {c.name: getattr(ann, c.name) for c in ann.__table__.columns}
+            annotation_dicts.append(ann_dict)
+        rt_dict['annotations'] = annotation_dicts
+        rt_dict['annotation_count'] = len(annotations)
         rts_with_data.append(rt_dict)
+
+    total_count = db.query(crud_quality.ReviewTask)
+    if project_id:
+        total_count = total_count.filter(crud_quality.ReviewTask.project_id == project_id)
+    if assignee_id:
+        total_count = total_count.filter(crud_quality.ReviewTask.assignee_id == assignee_id)
+    if status_filter:
+        total_count = total_count.filter(crud_quality.ReviewTask.status == status_filter)
+    total = total_count.count()
 
     total_pages = (total + page_size - 1) // page_size
 
@@ -364,3 +409,60 @@ def complete_rework(
 
     completed = crud_quality.complete_rework(db, rework_id, new_annotation_id)
     return ApiResponse(data=completed, message="返工任务完成")
+
+
+@router.post("/quality-checks/batch", response_model=ApiResponse)
+def batch_process_quality_checks(
+    quality_check_ids: List[int],
+    checker_id: int = Query(..., description="质检员ID"),
+    action: str = Query(..., description="批量操作：approve=通过/reject=驳回/rework=返工"),
+    common_comment: Optional[str] = Query(None, description="批量备注内容"),
+    common_quality_score: Optional[float] = Query(None, description="批量质检分数(0-1)"),
+    rework_reason: Optional[str] = Query(None, description="返工原因（action=rework时使用）"),
+    rework_target_annotator_id: Optional[int] = Query(None, description="返工目标标注员ID，不填则返回原标注员"),
+    db: Session = Depends(get_db),
+):
+    if not quality_check_ids:
+        return ApiResponse(code=400, message="质检记录ID列表不能为空", data=None)
+
+    if len(quality_check_ids) > 500:
+        return ApiResponse(code=400, message="单次批量处理不能超过500条", data=None)
+
+    if action not in ['approve', 'reject', 'rework']:
+        return ApiResponse(
+            code=400,
+            message="无效的操作类型，仅支持：approve（通过）、reject（驳回）、rework（返工）",
+            data=None,
+        )
+
+    checker = crud_users.get_user(db, checker_id)
+    if not checker:
+        raise HTTPException(status_code=404, detail="质检员不存在")
+
+    try:
+        result = crud_quality.batch_process_quality_checks(
+            db=db,
+            quality_check_ids=quality_check_ids,
+            checker_id=checker_id,
+            action=action,
+            common_comment=common_comment,
+            common_quality_score=common_quality_score,
+            rework_reason=rework_reason,
+            rework_target_annotator_id=rework_target_annotator_id,
+        )
+    except ValueError as e:
+        return ApiResponse(code=400, message=str(e), data=None)
+
+    action_msg = {
+        'approve': f"批量通过 {result['processed']} 条质检记录",
+        'reject': f"批量驳回 {result['processed']} 条质检记录",
+        'rework': f"批量创建返工 {len(result['rework_ids_created'])} 条",
+    }
+
+    return ApiResponse(
+        data=result,
+        message=(
+            f"处理完成：{action_msg.get(action, '批量操作完成')}；"
+            f"成功{result['processed']}条，失败{result['failed']}条"
+        ),
+    )

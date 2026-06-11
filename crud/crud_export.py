@@ -243,7 +243,7 @@ def get_result_summary(db: Session, project_id: int) -> Optional[ResultSummary]:
             })
     top_labels = sorted(top_labels, key=lambda x: -x['count'])[:10]
 
-    from models import User, AnnotationStatus
+    from models import User, AnnotationStatus, ReworkRecord, Task, TaskStatus
     annotator_rankings = []
     annotator_ids = (
         db.query(Annotation.annotator_id)
@@ -259,7 +259,7 @@ def get_result_summary(db: Session, project_id: int) -> Optional[ResultSummary]:
         if not user:
             continue
 
-        ann_count = (
+        ann_approved = (
             db.query(Annotation)
             .filter(
                 Annotation.project_id == project_id,
@@ -269,7 +269,17 @@ def get_result_summary(db: Session, project_id: int) -> Optional[ResultSummary]:
             .count()
         )
 
-        total_ann_count = (
+        ann_submitted = (
+            db.query(Annotation)
+            .filter(
+                Annotation.project_id == project_id,
+                Annotation.annotator_id == aid,
+                Annotation.status != AnnotationStatus.DRAFT,
+            )
+            .count()
+        )
+
+        ann_total = (
             db.query(Annotation)
             .filter(
                 Annotation.project_id == project_id,
@@ -278,17 +288,90 @@ def get_result_summary(db: Session, project_id: int) -> Optional[ResultSummary]:
             .count()
         )
 
-        acc_rate = round(ann_count / max(total_ann_count, 1), 4)
+        ann_rejected = (
+            db.query(Annotation)
+            .filter(
+                Annotation.project_id == project_id,
+                Annotation.annotator_id == aid,
+                Annotation.status == AnnotationStatus.REJECTED,
+            )
+            .count()
+        )
+
+        rework_count = (
+            db.query(ReworkRecord)
+            .filter(
+                ReworkRecord.project_id == project_id,
+                ReworkRecord.rework_annotator_id == aid,
+            )
+            .count()
+        )
+
+        tasks_total = (
+            db.query(Task)
+            .filter(
+                Task.project_id == project_id,
+                Task.assignee_id == aid,
+                Task.task_type == 'annotation',
+            )
+            .count()
+        )
+
+        tasks_completed = (
+            db.query(Task)
+            .filter(
+                Task.project_id == project_id,
+                Task.assignee_id == aid,
+                Task.task_type == 'annotation',
+                Task.status.in_([TaskStatus.COMPLETED, TaskStatus.SUBMITTED]),
+            )
+            .count()
+        )
+
+        time_records = (
+            db.query(Annotation.time_spent_seconds)
+            .filter(
+                Annotation.project_id == project_id,
+                Annotation.annotator_id == aid,
+                Annotation.time_spent_seconds.isnot(None),
+                Annotation.time_spent_seconds > 0,
+            )
+            .all()
+        )
+        avg_time_seconds = None
+        total_time_seconds = 0
+        if time_records:
+            times = [t[0] for t in time_records if t[0] is not None]
+            if times:
+                avg_time_seconds = round(sum(times) / len(times), 2)
+                total_time_seconds = round(sum(times), 2)
+
+        pass_rate = round(ann_approved / max(ann_submitted, 1), 4)
+        task_completion_rate = round(tasks_completed / max(tasks_total, 1), 4)
 
         annotator_rankings.append({
             'annotator_id': aid,
             'annotator_name': user.display_name,
-            'approved_count': ann_count,
-            'total_count': total_ann_count,
-            'accuracy_rate': acc_rate,
+            'annotator_username': user.username,
+            'annotator_role': user.role.value,
+            'approved_count': ann_approved,
+            'submitted_count': ann_submitted,
+            'total_count': ann_total,
+            'rejected_count': ann_rejected,
+            'rework_count': rework_count,
+            'pass_rate': pass_rate,
+            'tasks_total': tasks_total,
+            'tasks_completed': tasks_completed,
+            'task_completion_rate': task_completion_rate,
+            'avg_time_per_sample_seconds': avg_time_seconds,
+            'total_time_seconds': total_time_seconds,
+            'accuracy_rate': pass_rate,
         })
 
-    annotator_rankings = sorted(annotator_rankings, key=lambda x: (-x['approved_count'], -x['accuracy_rate']))
+    annotator_rankings = sorted(
+        annotator_rankings,
+        key=lambda x: (-x['approved_count'], -x['pass_rate'])
+    )
 
     return ResultSummary(
         project_id=project_id,

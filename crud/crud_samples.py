@@ -1,5 +1,6 @@
 from typing import List, Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import func, or_
 
 from models import Sample, SampleStatus
 from schemas import SampleCreate, SampleBatchCreate
@@ -128,7 +129,7 @@ def get_pending_samples_for_annotator(
     annotation_count_subquery = (
         db.query(
             Annotation.sample_id.label('sample_id'),
-            db.func.count(Annotation.id).label('ann_count')
+            func.count(Annotation.id).label('ann_count')
         )
         .filter(Annotation.project_id == project_id)
         .group_by(Annotation.sample_id)
@@ -142,7 +143,7 @@ def get_pending_samples_for_annotator(
             Sample.project_id == project_id,
             Sample.id.notin_(annotated_subquery),
             Sample.status.in_([SampleStatus.PENDING, SampleStatus.ASSIGNED, SampleStatus.ANNOTATING]),
-            db.or_(
+            or_(
                 annotation_count_subquery.c.ann_count.is_(None),
                 annotation_count_subquery.c.ann_count < required_annotators,
             )

@@ -198,9 +198,22 @@ def list_samples(
     samples = crud_samples.get_samples(db, project_id, skip, page_size, status_enum)
     total_pages = (total + page_size - 1) // page_size
 
+    def _sample_to_dict(s):
+        if s is None: return None
+        d = {}
+        for c in s.__table__.columns:
+            col = c.name
+            if col == 'metadata':
+                d[col] = s.sample_metadata
+            else:
+                d[col] = getattr(s, col)
+        return d
+
+    sample_dicts = [_sample_to_dict(s) for s in samples]
+
     return ApiResponse(data=PaginatedResponse(
         total=total, page=page, page_size=page_size,
-        total_pages=total_pages, items=samples,
+        total_pages=total_pages, items=sample_dicts,
     ))
 
 
@@ -221,10 +234,26 @@ def get_sample(
     from crud import crud_annotations
     annotations = crud_annotations.get_sample_annotations(db, sample_id)
 
+    def _sample_to_dict(s):
+        if s is None: return None
+        d = {}
+        for c in s.__table__.columns:
+            col = c.name
+            if col == 'metadata':
+                d[col] = s.sample_metadata
+            else:
+                d[col] = getattr(s, col)
+        return d
+
+    sample_dict = _sample_to_dict(sample)
+    ann_dicts = []
+    for a in annotations:
+        ann_dicts.append({c.name: getattr(a, c.name) for c in a.__table__.columns})
+
     data = {
-        "sample": sample,
-        "annotations": annotations,
-        "annotation_count": len(annotations),
+        "sample": sample_dict,
+        "annotations": ann_dicts,
+        "annotation_count": len(ann_dicts),
     }
 
     return ApiResponse(data=data)
